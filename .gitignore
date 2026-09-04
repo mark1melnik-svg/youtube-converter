@@ -1,0 +1,18 @@
+# Сборка PyInstaller и виртуальное окружение
+dist/
+build/
+*.spec
+venv/
+.venv/
+
+# Локальные тяжелые бинарники и кэш
+*.exe
+bin/
+_internal/
+__pycache__/
+*.pyc
+
+# Личные данные пользователей и сессии
+cookies.txt
+*.log
+settings.json
