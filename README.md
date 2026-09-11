@@ -21,7 +21,7 @@
 
 Если YouTube запрашивает проверку на бота или прерывает загрузку с ошибкой, используйте авторизацию через cookies:
 
-1. Установите расширение для браузера для экспорта cookies (например, *Get cookies.txt LOCALLY*).
+1. Установите расширение для браузера для экспорта cookies (*Get cookies.txt LOCALLY* — [ссылка](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)).
 2. Авторизуйтесь на сайте YouTube в браузере.
 3. Экспортируйте файл куков под именем `cookies.txt`.
 4. Укажите путь к файлу в **Настройках** программы либо положите `cookies.txt` в папку рядом с `yt_converter.exe`.
