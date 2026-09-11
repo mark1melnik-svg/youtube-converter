@@ -91,7 +91,7 @@ class YouTubeConverterApp:
         ctk.set_appearance_mode(self.theme_mode)
         ctk.set_default_color_theme("blue")
 
-        self.root.title(self._t("app_title") + " v1.0.0")
+        self.root.title(self._t("app_title") + " v1.0.1")
         self.root.geometry("1180x760")
         self.root.minsize(980, 620)
         self.root.configure(fg_color=APPLE_BG)
@@ -201,7 +201,7 @@ class YouTubeConverterApp:
         return self.trans.get(self.lang, {}).get(key, key)
 
     def retranslate_ui(self):
-        self.root.title(self._t("app_title") + " v1.0.0")
+        self.root.title(self._t("app_title") + " v1.0.1")
 
         self.url_label.configure(text=self._t("url"))
         self.mode_label.configure(text=self._t("mode"))
