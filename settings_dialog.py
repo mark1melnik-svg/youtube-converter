@@ -1,194 +1,376 @@
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import filedialog
+import customtkinter as ctk
 
-import sv_ttk
 
-
-class SettingsDialog(tk.Toplevel):
+class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
+        self._initial_theme = getattr(self.app, "theme_mode", "dark")
+        # transient() keeps the dialog above the parent without blocking input (no grab_set).
+        # This fixes the "opens behind main window" bug on Windows DWM.
         self.transient(parent)
-        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.bind("<Destroy>", self._on_destroy)
         self.title(self.app._t("settings_title"))
-        self.geometry("760x620")
-        self.minsize(700, 520)
-        self.resizable(True, True)
+        self.resizable(False, False)
 
-        self._apply_dialog_theme()
+        # Dynamic appearance palette tuples: (light, dark)
+        self._bg_main = ("#F2F2F7", "#161618")
+        self._bg_card = ("#FFFFFF", "#242426")
+        self._border_card = ("#E5E5EA", "#323234")
+        self._btn_secondary = ("#E5E5EA", "#2C2C2E")
+        self._btn_secondary_hover = ("#D1D1D6", "#3A3A3C")
+        self._btn_primary = ("#007AFF", "#0A84FF")
+        self._btn_primary_hover = ("#0051A8", "#0066CC")
+        self._text_color = ("#000000", "#FFFFFF")
+        self._text_muted = ("#8E8E93", "#8E8E93")
+        self._input_bg = ("#E5E5EA", "#1C1C1E")
+        self._input_border = ("#D1D1D6", "#38383A")
 
-        container = ttk.Frame(self, style="SettingsDlg.TFrame")
-        container.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
-        container.columnconfigure(0, weight=1)
-        container.rowconfigure(0, weight=1)
+        self.configure(fg_color=self._bg_main)
 
-        self.canvas = tk.Canvas(container, highlightthickness=0, borderwidth=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
-        vscroll = ttk.Scrollbar(container, orient="vertical", command=self.canvas.yview)
-        vscroll.grid(row=0, column=1, sticky="ns")
-        self.canvas.configure(yscrollcommand=vscroll.set)
+        self._setup_ui()
 
-        main_frame = ttk.Frame(self.canvas, style="SettingsDlg.TFrame")
-        self._canvas_window = self.canvas.create_window((0, 0), window=main_frame, anchor="nw")
-        self._main_frame = main_frame
+        # Centering over parent based on true bounding box
+        self.update_idletasks()
+        w = 640
+        h = max(680, self.winfo_reqheight() + 28)
+        pw = max(parent.winfo_width(), 640)
+        ph = max(parent.winfo_height(), h)
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        x = max(40, px + (pw - w) // 2)
+        y = max(40, py + (ph - h) // 2)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
-        main_frame.bind("<Configure>", self._on_frame_configure)
-        self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.lift()
+        self.focus_force()
 
-        downloads_frame = ttk.LabelFrame(main_frame, text=self.app._t("settings_section_downloads"), style="SettingsDlg.TLabelframe")
-        downloads_frame.grid(row=0, column=0, sticky="we", pady=(0, 14))
-        downloads_frame.columnconfigure(0, weight=1)
+    def _setup_ui(self):
+        main_container = ctk.CTkFrame(self, fg_color="transparent")
+        main_container.pack(fill="both", expand=True, padx=20, pady=(16, 16))
 
-        ttk.Label(downloads_frame, text=self.app._t("default_download_folder"), style="SettingsDlg.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 6), padx=12
+        # --- SECTION 1: Downloads & Encoding ---
+        card_downloads = ctk.CTkFrame(
+            main_container,
+            fg_color=self._bg_card,
+            border_color=self._border_card,
+            border_width=1,
+            corner_radius=12,
         )
-        path_frame = ttk.Frame(downloads_frame, style="SettingsDlg.TFrame")
-        path_frame.grid(row=1, column=0, sticky="we", padx=12)
-        self.download_path_entry = ttk.Entry(path_frame, style="SettingsDlg.TEntry")
-        self.download_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        card_downloads.pack(fill="x", pady=(0, 12), padx=0)
+
+        ctk.CTkLabel(
+            card_downloads,
+            text=self.app._t("settings_section_downloads"),
+            font=("Segoe UI", 13, "bold"),
+            text_color=self._text_color,
+        ).pack(anchor="w", padx=16, pady=(12, 8))
+
+        # Download path row
+        ctk.CTkLabel(
+            card_downloads,
+            text=self.app._t("default_download_folder"),
+            font=("Segoe UI", 11),
+            text_color=self._text_muted,
+        ).pack(anchor="w", padx=16, pady=(2, 2))
+
+        path_frame = ctk.CTkFrame(card_downloads, fg_color="transparent")
+        path_frame.pack(fill="x", padx=16, pady=(0, 10))
+        self.download_path_entry = ctk.CTkEntry(
+            path_frame,
+            fg_color=self._input_bg,
+            border_color=self._input_border,
+            text_color=self._text_color,
+            corner_radius=8,
+            height=32,
+        )
+        self.download_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.download_path_entry.insert(0, self.app.default_download_dir)
-        ttk.Button(path_frame, text=self.app._t("browse"), command=self.browse_folder, style="SettingsDlg.TButton").pack(side=tk.LEFT, padx=8)
-        ttk.Button(path_frame, text=self.app._t("open_folder"), command=self.open_download_folder, style="SettingsDlg.TButton").pack(side=tk.LEFT)
 
-        ttk.Label(downloads_frame, text=self.app._t("cookies_folder"), style="SettingsDlg.TLabel").grid(
-            row=2, column=0, sticky="w", pady=(18, 6), padx=12
+        ctk.CTkButton(
+            path_frame,
+            text=self.app._t("browse"),
+            command=self.browse_folder,
+            fg_color=self._btn_secondary,
+            hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            corner_radius=8,
+            width=85,
+            height=32,
+        ).pack(side="left")
+
+        # Cookies path row
+        ctk.CTkLabel(
+            card_downloads,
+            text=self.app._t("cookies_folder"),
+            font=("Segoe UI", 11),
+            text_color=self._text_muted,
+        ).pack(anchor="w", padx=16, pady=(2, 2))
+
+        cookies_frame = ctk.CTkFrame(card_downloads, fg_color="transparent")
+        cookies_frame.pack(fill="x", padx=16, pady=(0, 10))
+        self.cookies_path_entry = ctk.CTkEntry(
+            cookies_frame,
+            fg_color=self._input_bg,
+            border_color=self._input_border,
+            text_color=self._text_color,
+            corner_radius=8,
+            height=32,
         )
-        cookies_frame = ttk.Frame(downloads_frame, style="SettingsDlg.TFrame")
-        cookies_frame.grid(row=3, column=0, sticky="we", padx=12)
-        self.cookies_path_entry = ttk.Entry(cookies_frame, style="SettingsDlg.TEntry")
-        self.cookies_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.cookies_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         if getattr(self.app, "cookies_dir", None):
             self.cookies_path_entry.insert(0, self.app.cookies_dir)
-        ttk.Button(cookies_frame, text=self.app._t("browse"), command=self.browse_cookies_folder, style="SettingsDlg.TButton").pack(
-            side=tk.LEFT, padx=8
-        )
 
-        ttk.Label(downloads_frame, text=self.app._t("filename_template"), style="SettingsDlg.TLabel").grid(
-            row=4, column=0, sticky="w", pady=(18, 6), padx=12
-        )
-        self.filename_template_entry = ttk.Entry(downloads_frame, style="SettingsDlg.TEntry")
-        self.filename_template_entry.grid(row=5, column=0, sticky="we", padx=12)
-        self.filename_template_entry.insert(0, getattr(self.app, "filename_template", "%(title)s"))
-        ttk.Label(
-            downloads_frame,
-            text=self.app._t("filename_template_hint"),
-            style="SettingsDlg.Hint.TLabel",
-        ).grid(row=6, column=0, sticky="w", pady=(4, 4), padx=12)
+        ctk.CTkButton(
+            cookies_frame,
+            text=self.app._t("browse"),
+            command=self.browse_cookies_folder,
+            fg_color=self._btn_secondary,
+            hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            corner_radius=8,
+            width=85,
+            height=32,
+        ).pack(side="left")
 
-        interface_frame = ttk.LabelFrame(main_frame, text=self.app._t("settings_section_interface"), style="SettingsDlg.TLabelframe")
-        interface_frame.grid(row=1, column=0, sticky="we", pady=(0, 14))
-        interface_frame.columnconfigure(0, weight=1)
+        # Filename template row (simplified dropdown)
+        ctk.CTkLabel(
+            card_downloads,
+            text=self.app._t("filename_template"),
+            font=("Segoe UI", 11),
+            text_color=self._text_muted,
+        ).pack(anchor="w", padx=16, pady=(2, 2))
+
+        self.preset_map = {
+            self.app._t("template_preset_title"): "%(title)s",
+            self.app._t("template_preset_uploader_title"): "%(uploader)s - %(title)s",
+            self.app._t("template_preset_title_id"): "%(title)s [%(id)s]",
+        }
+
+        current_tmpl = getattr(self.app, "filename_template", "%(title)s")
+        current_preset = self.app._t("template_preset_title")
+        for label, val in self.preset_map.items():
+            if current_tmpl == val:
+                current_preset = label
+                break
+            elif "%(title,id)s" in current_tmpl and val == "%(title)s [%(id)s]":
+                current_preset = label
+                break
+
+        self.preset_menu = ctk.CTkOptionMenu(
+            card_downloads,
+            values=list(self.preset_map.keys()),
+            fg_color=self._input_bg,
+            button_color=self._btn_secondary,
+            button_hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            dropdown_fg_color=self._bg_card,
+            dropdown_hover_color=self._btn_primary,
+            dropdown_text_color=self._text_color,
+            corner_radius=8,
+            height=32,
+        )
+        self.preset_menu.set(current_preset)
+        self.preset_menu.pack(fill="x", padx=16, pady=(0, 10))
+
+        # Hardware acceleration row
+        ctk.CTkLabel(
+            card_downloads,
+            text=self.app._t("settings_hw_accel"),
+            font=("Segoe UI", 11),
+            text_color=self._text_muted,
+        ).pack(anchor="w", padx=16, pady=(2, 2))
+
+        self.hw_map = {
+            self.app._t("hw_accel_auto"): "auto",
+            self.app._t("hw_accel_nvenc"): "nvenc",
+            self.app._t("hw_accel_qsv"): "qsv",
+            self.app._t("hw_accel_amf"): "amf",
+            self.app._t("hw_accel_disabled"): "disabled",
+        }
+
+        current_hw = getattr(self.app, "hw_accel", "auto")
+        current_hw_label = self.app._t("hw_accel_auto")
+        for label, val in self.hw_map.items():
+            if current_hw == val:
+                current_hw_label = label
+                break
+
+        self.hw_menu = ctk.CTkOptionMenu(
+            card_downloads,
+            values=list(self.hw_map.keys()),
+            fg_color=self._input_bg,
+            button_color=self._btn_secondary,
+            button_hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            dropdown_fg_color=self._bg_card,
+            dropdown_hover_color=self._btn_primary,
+            dropdown_text_color=self._text_color,
+            corner_radius=8,
+            height=32,
+        )
+        self.hw_menu.set(current_hw_label)
+        self.hw_menu.pack(fill="x", padx=16, pady=(0, 14))
+
+        # --- SECTION 2: Interface & Behavior ---
+        card_interface = ctk.CTkFrame(
+            main_container,
+            fg_color=self._bg_card,
+            border_color=self._border_card,
+            border_width=1,
+            corner_radius=12,
+        )
+        card_interface.pack(fill="x", pady=(0, 14), padx=0)
+
+        ctk.CTkLabel(
+            card_interface,
+            text=self.app._t("settings_section_interface"),
+            font=("Segoe UI", 13, "bold"),
+            text_color=self._text_color,
+        ).pack(anchor="w", padx=16, pady=(12, 8))
+
+        # Checkboxes
         self.open_folder_var = tk.BooleanVar(value=getattr(self.app, "open_folder_after_download", False))
-        ttk.Checkbutton(
-            interface_frame,
+        ctk.CTkCheckBox(
+            card_interface,
             text=self.app._t("open_folder_after"),
             variable=self.open_folder_var,
-            style="SettingsDlg.TCheckbutton",
-        ).grid(row=0, column=0, sticky="w", pady=(12, 8), padx=12)
+            fg_color=self._btn_primary,
+            hover_color=self._btn_primary_hover,
+            border_color="#636366",
+            text_color=self._text_color,
+            font=("Segoe UI", 11),
+            corner_radius=4,
+        ).pack(anchor="w", padx=16, pady=(2, 6))
 
+        auto_paste_val = False
+        if hasattr(self.app, "auto_paste_clipboard_var") and self.app.auto_paste_clipboard_var is not None:
+            auto_paste_val = bool(self.app.auto_paste_clipboard_var.get())
+        self.auto_paste_var = tk.BooleanVar(value=auto_paste_val)
+        ctk.CTkCheckBox(
+            card_interface,
+            text=self.app._t("auto_paste_clipboard"),
+            variable=self.auto_paste_var,
+            fg_color=self._btn_primary,
+            hover_color=self._btn_primary_hover,
+            border_color="#636366",
+            text_color=self._text_color,
+            font=("Segoe UI", 11),
+            corner_radius=4,
+        ).pack(anchor="w", padx=16, pady=(2, 10))
+
+        # Selectors: Theme & Language
+        selectors_frame = ctk.CTkFrame(card_interface, fg_color="transparent")
+        selectors_frame.pack(fill="x", padx=16, pady=(0, 14))
+
+        # Theme selector
+        theme_sub = ctk.CTkFrame(selectors_frame, fg_color="transparent")
+        theme_sub.pack(side="left", padx=(0, 24))
+        ctk.CTkLabel(
+            theme_sub,
+            text=self.app._t("settings_theme"),
+            font=("Segoe UI", 11),
+            text_color=self._text_muted,
+        ).pack(anchor="w", pady=(0, 4))
         self.theme_var = tk.StringVar(value=self.app.theme_mode)
-        theme_frame = ttk.LabelFrame(interface_frame, text="Тема / Theme", style="SettingsDlg.TLabelframe")
-        theme_frame.grid(row=1, column=0, sticky="we", pady=(10, 8), padx=12)
-        ttk.Radiobutton(theme_frame, text=self.app._t("theme_dark"), value="dark", variable=self.theme_var, style="SettingsDlg.TRadiobutton").pack(
-            side=tk.LEFT, padx=10, pady=6
+        self.theme_segmented = ctk.CTkSegmentedButton(
+            theme_sub,
+            values=["dark", "light"],
+            variable=self.theme_var,
+            selected_color=self._btn_primary,
+            selected_hover_color=self._btn_primary_hover,
+            unselected_color=self._btn_secondary,
+            unselected_hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            corner_radius=8,
+            height=30,
         )
-        ttk.Radiobutton(theme_frame, text=self.app._t("theme_light"), value="light", variable=self.theme_var, style="SettingsDlg.TRadiobutton").pack(
-            side=tk.LEFT, padx=10, pady=6
+        self.theme_segmented.pack(anchor="w")
+
+        # Language selector
+        lang_sub = ctk.CTkFrame(selectors_frame, fg_color="transparent")
+        lang_sub.pack(side="left")
+        ctk.CTkLabel(
+            lang_sub,
+            text=self.app._t("settings_lang"),
+            font=("Segoe UI", 11),
+            text_color=self._text_muted,
+        ).pack(anchor="w", pady=(0, 4))
+        self.lang_var = tk.StringVar(value=self.app.lang.upper())
+        self.lang_segmented = ctk.CTkSegmentedButton(
+            lang_sub,
+            values=["RU", "EN"],
+            variable=self.lang_var,
+            selected_color=self._btn_primary,
+            selected_hover_color=self._btn_primary_hover,
+            unselected_color=self._btn_secondary,
+            unselected_hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            corner_radius=8,
+            height=30,
         )
+        self.lang_segmented.pack(anchor="w")
 
-        self.lang_var = tk.StringVar(value=self.app.lang)
-        lang_frame = ttk.LabelFrame(interface_frame, text="Язык / Language", style="SettingsDlg.TLabelframe")
-        lang_frame.grid(row=2, column=0, sticky="we", pady=(6, 8), padx=12)
-        ttk.Radiobutton(lang_frame, text="RU", value="ru", variable=self.lang_var, style="SettingsDlg.TRadiobutton").pack(
-            side=tk.LEFT, padx=10, pady=6
-        )
-        ttk.Radiobutton(lang_frame, text="EN", value="en", variable=self.lang_var, style="SettingsDlg.TRadiobutton").pack(
-            side=tk.LEFT, padx=10, pady=6
-        )
+        # --- BOTTOM ACTIONS: Save & Cancel ---
+        actions_frame = ctk.CTkFrame(main_container, fg_color="transparent")
+        actions_frame.pack(fill="x", side="bottom", pady=(14, 24))
 
-        actions_frame = ttk.Frame(main_frame, style="SettingsDlg.TFrame")
-        actions_frame.grid(row=2, column=0, sticky="e", pady=(14, 2))
-        ttk.Button(actions_frame, text=self.app._t("close"), command=self.destroy, style="SettingsDlg.TButton").pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Button(actions_frame, text=self.app._t("ok"), command=self.on_ok, style="SettingsDlg.TButton").pack(side=tk.RIGHT, padx=(8, 0))
-        ttk.Button(actions_frame, text=self.app._t("apply"), command=self.on_apply, style="SettingsDlg.TButton").pack(side=tk.RIGHT)
+        ctk.CTkButton(
+            actions_frame,
+            text=self.app._t("settings_cancel"),
+            command=self.on_cancel,
+            fg_color=self._btn_secondary,
+            hover_color=self._btn_secondary_hover,
+            text_color=self._text_color,
+            corner_radius=8,
+            width=100,
+            height=34,
+        ).pack(side="right", padx=(8, 0))
 
-        main_frame.columnconfigure(0, weight=1)
+        ctk.CTkButton(
+            actions_frame,
+            text=self.app._t("settings_save"),
+            command=self.on_save,
+            fg_color=self._btn_primary,
+            hover_color=self._btn_primary_hover,
+            text_color="#FFFFFF",
+            font=("Segoe UI", 11, "bold"),
+            corner_radius=8,
+            width=110,
+            height=34,
+        ).pack(side="right")
 
-    def _on_frame_configure(self, event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-
-    def _apply_dialog_theme(self):
-        is_dark = self.app.theme_mode == "dark"
-        # Match main app palette (pleasant modern look)
-        if is_dark:
-            bg = "#1f1f1f"
-            surface = "#242424"
-            surface2 = "#2a2a2a"
-            border = "#353535"
-            fg = "#f2f2f2"
-            fg_muted = "#b7b7b7"
-            accent = "#4cc2ff"
-        else:
-            bg = "#f5f6f8"
-            surface = "#ffffff"
-            surface2 = "#f7f8fa"
-            border = "#d9dde3"
-            fg = "#111111"
-            fg_muted = "#5b5f66"
-            accent = "#2563eb"
-        style = ttk.Style(self)
-        self.configure(bg=bg)
-        style.configure("SettingsDlg.TFrame", background=bg)
-        style.configure("SettingsDlg.TLabelframe", background=surface, bordercolor=border, borderwidth=1, relief="flat", padding=10)
-        style.configure("SettingsDlg.TLabelframe.Label", background=surface, foreground=fg, font=("Segoe UI", 10, "bold"))
-        style.configure("SettingsDlg.TLabel", background=surface, foreground=fg, font=("Segoe UI", 10))
-        style.configure("SettingsDlg.Hint.TLabel", background=surface, foreground=fg_muted, font=("Segoe UI", 9))
-        style.configure("SettingsDlg.TEntry", fieldbackground=surface2, foreground=fg, bordercolor=border, relief="flat", padding=8)
-        style.configure("SettingsDlg.TButton", padding=(14, 9), background=surface2, foreground=fg, borderwidth=1, relief="flat", bordercolor=border)
-        style.map("SettingsDlg.TButton", background=[("active", surface), ("pressed", surface2)], bordercolor=[("active", accent), ("pressed", accent)])
-        style.configure("SettingsDlg.TCheckbutton", background=bg, foreground=fg)
-        style.configure("SettingsDlg.TRadiobutton", background=bg, foreground=fg)
-        if hasattr(self, "canvas"):
-            self.canvas.configure(bg=bg, highlightthickness=0, borderwidth=0)
-
-    def _on_canvas_configure(self, event):
-        self.canvas.itemconfigure(self._canvas_window, width=event.width)
-
-    def _on_mousewheel(self, event):
+    def _safe_grab_release(self):
         try:
-            if event.widget.winfo_toplevel() is not self:
-                return
-        except tk.TclError:
-            return
-        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            self.grab_release()
+        except Exception:
+            pass
+
+    def _on_destroy(self, event=None):
+        if event is None or event.widget is self:
+            self._safe_grab_release()
 
     def destroy(self):
+        self._safe_grab_release()
         try:
-            self.unbind_all("<MouseWheel>")
-        except tk.TclError:
+            super().destroy()
+        except Exception:
             pass
-        super().destroy()
-
-    def open_download_folder(self):
-        path = self.download_path_entry.get().strip() or self.app.default_download_dir
-        if os.name == "nt":
-            try:
-                os.startfile(path)
-            except Exception as e:
-                self.app.log(self.app._t("open_folder_fail").format(err=e), tag="err")
-        else:
-            self.app.log(self.app._t("open_folder_non_windows"), tag="warn")
+        if getattr(self.app, "_settings_dialog", None) is self:
+            self.app._settings_dialog = None
 
     def browse_folder(self):
-        folder = filedialog.askdirectory(title=self.app._t("choose_download_folder"))
+        folder = filedialog.askdirectory(
+            title=self.app._t("choose_download_folder"),
+            initialdir=self.download_path_entry.get().strip() or self.app.default_download_dir,
+        )
         if folder:
             self.download_path_entry.delete(0, tk.END)
             self.download_path_entry.insert(0, folder)
-            self.app.default_download_dir = folder
-            self.app.download_dir_label.config(text=folder)
-            self.app.log(self.app._t("log_download_folder_updated").format(path=folder), tag="ok")
 
     def browse_cookies_folder(self):
         path = filedialog.askopenfilename(
@@ -198,18 +380,18 @@ class SettingsDialog(tk.Toplevel):
         if path:
             self.cookies_path_entry.delete(0, tk.END)
             self.cookies_path_entry.insert(0, path)
-            self.app.cookies_dir = path
-            self.app.log(self.app._t("log_cookies_folder").format(path=path), tag="ok")
 
-    def on_ok(self):
-        self.on_apply()
+    def on_cancel(self):
+        self._safe_grab_release()
         self.destroy()
 
-    def on_apply(self):
+    def on_save(self):
+        self._safe_grab_release()
         new_dir = self.download_path_entry.get().strip()
         if new_dir and new_dir != self.app.default_download_dir:
             self.app.default_download_dir = new_dir
-            self.app.download_dir_label.config(text=new_dir)
+            if hasattr(self.app, "download_dir_label"):
+                self.app.download_dir_label.configure(text=new_dir)
             self.app.log(self.app._t("log_download_folder_updated").format(path=new_dir), tag="ok")
 
         cookies_dir = self.cookies_path_entry.get().strip()
@@ -218,28 +400,24 @@ class SettingsDialog(tk.Toplevel):
             if cookies_dir:
                 self.app.log(self.app._t("log_cookies_folder").format(path=cookies_dir), tag="ok")
 
-        new_template = self.filename_template_entry.get().strip() or "%(title)s"
-        if new_template != self.app.filename_template:
-            self.app.filename_template = new_template
+        selected_preset = self.preset_menu.get()
+        self.app.filename_template = self.preset_map.get(selected_preset, "%(title)s")
+
+        selected_hw = self.hw_menu.get()
+        self.app.hw_accel = self.hw_map.get(selected_hw, "auto")
 
         self.app.open_folder_after_download = self.open_folder_var.get()
+        if hasattr(self.app, "auto_paste_clipboard_var"):
+            self.app.auto_paste_clipboard_var.set(self.auto_paste_var.get())
 
-        new_theme = self.theme_var.get()
-        if new_theme != self.app.theme_mode:
-            self.app.theme_mode = new_theme
-            if new_theme == "dark":
-                sv_ttk.set_theme("dark")
-            else:
-                sv_ttk.set_theme("light")
-            if hasattr(self.app, "_apply_theme_style"):
-                self.app._apply_theme_style()
-            self._apply_dialog_theme()
-            if hasattr(self.app, "_update_queue_drop_indicator_style"):
-                self.app._update_queue_drop_indicator_style()
+        new_theme = self.theme_var.get().lower()
+        self.app.change_theme(new_theme)
 
-        new_lang = self.lang_var.get()
+        new_lang = self.lang_var.get().lower()
         if new_lang != self.app.lang:
             self.app.lang = new_lang
-            self.app.retranslate_ui()
+            if hasattr(self.app, "retranslate_ui"):
+                self.app.retranslate_ui()
 
         self.app.save_settings()
+        self.destroy()

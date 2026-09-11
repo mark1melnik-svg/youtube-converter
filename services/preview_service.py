@@ -55,19 +55,11 @@ def _add_js_runtime_hints(cmd: list[str], app=None) -> list[str]:
 def fetch_video_info(app, url: str) -> dict | None:
     try:
         ytdlp_cmd = app.get_ytdlp_cmd()
-        try:
-            app._enqueue_ui(
-                lambda: app.log(
-                    f"ℹ️ yt-dlp for preview: {ytdlp_cmd[0]} [{app._describe_ytdlp_source(ytdlp_cmd)}]",
-                    tag="ok",
-                )
-            )
-        except Exception:
-            pass
 
         cmd = ytdlp_cmd + [
+            "--no-playlist",
             "--extractor-args",
-            "youtube:player_client=web,web_safari",
+            "youtube:player_client=android,web",
             "-J",
             url,
         ]
@@ -147,24 +139,30 @@ def fetch_video_info(app, url: str) -> dict | None:
 
 def update_preview_from_info(app, info: dict | None):
     if not info:
+        app.preview_video_title = ""
+        app.preview_uploader = ""
+        app.preview_video_id = ""
         app.thumb_image = None
         app.thumb_full_image = None
         app.thumb_source_image = None
-        app.thumb_label.config(image="")
+        app.thumb_label.configure(image=None)
         if app.preview_title_label:
-            app.preview_title_label.config(text="")
+            app.preview_title_label.configure(text="")
         if app.preview_channel_label:
-            app.preview_channel_label.config(text="")
+            app.preview_channel_label.configure(text="")
         return
 
     title = info.get("title") or ""
+    app.preview_video_title = title
     uploader = info.get("uploader") or ""
+    app.preview_uploader = uploader
+    app.preview_video_id = info.get("id") or ""
     if app.preview_title_label:
-        app.preview_title_label.config(
+        app.preview_title_label.configure(
             text=title[:80] + ("…" if len(title) > 80 else "")
         )
     if app.preview_channel_label:
-        app.preview_channel_label.config(text=uploader)
+        app.preview_channel_label.configure(text=uploader)
 
     thumb = info.get("thumbnail")
     thumbs = info.get("thumbnails") or []
@@ -175,7 +173,7 @@ def update_preview_from_info(app, info: dict | None):
         app.thumb_image = None
         app.thumb_full_image = None
         app.thumb_source_image = None
-        app.thumb_label.config(image="")
+        app.thumb_label.configure(image=None)
 
 
 def show_thumbnail_from_url(app, url: str):
@@ -214,5 +212,9 @@ def refresh_thumbnail_size(app):
         img_full = source.copy()
 
     app.thumb_full_image = ImageTk.PhotoImage(img_full)
-    app.thumb_image = ImageTk.PhotoImage(img_small)
-    app.thumb_label.config(image=app.thumb_image)
+    try:
+        import customtkinter as ctk
+        app.thumb_image = ctk.CTkImage(light_image=img_small, dark_image=img_small, size=img_small.size)
+    except Exception:
+        app.thumb_image = ImageTk.PhotoImage(img_small)
+    app.thumb_label.configure(image=app.thumb_image)

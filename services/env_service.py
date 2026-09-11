@@ -58,6 +58,7 @@ def _get_node_version(app) -> tuple[str | None, str | None]:
             encoding="utf-8",
             errors="ignore",
             check=False,
+            timeout=10,
             **subprocess_window_kwargs(),
         )
         if proc.returncode != 0:
@@ -176,30 +177,6 @@ def _frozen_binary_roots(app) -> list[str]:
     return roots
 
 
-def get_ffmpeg_path(app):
-    """
-    Ищет ffmpeg.exe: сначала строго локально в папках программы,
-    а если не находит — заглядывает в глобальный Windows PATH.
-    """
-    roots = _frozen_binary_roots(app)
-    for base_dir in roots:
-        ffmpeg_path = os.path.join(base_dir, "ffmpeg.exe")
-        if os.path.isfile(ffmpeg_path):
-            return ffmpeg_path
-
-    # Дополнительно проверяем текущий рабочий каталог
-    cwd_ffmpeg = os.path.join(os.getcwd(), "ffmpeg.exe")
-    if os.path.isfile(cwd_ffmpeg):
-        return cwd_ffmpeg
-
-    # Если локально пусто, ищем в глобальной системе Windows
-    system_ffmpeg = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
-    if system_ffmpeg:
-        return system_ffmpeg
-
-    hint = roots[0] if roots else app.get_executable_dir()
-    app.log(app._t("ffmpeg_not_found").format(base=hint), tag="warn")
-    return None
 
 
 def get_ffmpeg_path(app):
@@ -389,121 +366,158 @@ def get_cookies_path(app):
     return None
 
 
-def check_environment(app):
-    ytdlp_status = "❌"
-    ytdlp_extra = ""
-    try:
-        ytdlp_cmd = app.get_ytdlp_cmd()
-        app.log(f"🔍 Проверка yt-dlp: {ytdlp_cmd}", tag="ok")
-        proc = subprocess.run(
-            ytdlp_cmd + ["--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            check=False,
-            **subprocess_window_kwargs(),
-        )
+def check_environment(app, verbose: bool = False):
+    """Запускает проверку окружения в фоновом потоке, чтобы не блокировать UI."""
+    import threading
 
-        if proc.returncode != 0:
-            app.log(f"❌ yt-dlp вернул код {proc.returncode}", tag="err")
-            app.log(f"   stderr: {proc.stderr}", tag="err")
-        else:
-            ver = (proc.stdout or "").strip()
-            ytdlp_status = "✅"
-            if ver:
-                ytdlp_extra = f" {ver}"
-                app.log(f"✅ yt-dlp найден: {ver}", tag="ok")
-            else:
-                app.log("✅ yt-dlp найден (версия неизвестна)", tag="ok")
+    if getattr(app, "_env_check_running", False):
+        return
+    app._env_check_running = True
 
-    except FileNotFoundError as e:
-        app.log(f"❌ yt-dlp не найден: {e}", tag="err")
-    except Exception as e:
-        app.log(f"❌ Ошибка при проверке yt-dlp: {e}", tag="err")
-
-    app.env_ytdlp_label.config(text=f"yt-dlp: {ytdlp_status}{ytdlp_extra}")
-
-    ffmpeg_status = "❌"
-    try:
-        ffmpeg_path = app.get_ffmpeg_path()
-        if ffmpeg_path:
-            app.log(f"✅ ffmpeg найден локально: {ffmpeg_path}", tag="ok")
-            ffmpeg_status = "✅"
-        else:
-            proc = subprocess.run(
-                ["ffmpeg", "-version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                check=False,
-                **subprocess_window_kwargs(),
-            )
-            if proc.returncode == 0:
-                ffmpeg_status = "✅"
-                app.log("✅ ffmpeg найден в системном PATH", tag="ok")
-            else:
-                app.log("❌ ffmpeg не найден в PATH", tag="warn")
-    except FileNotFoundError:
-        app.log("⚠️ ffmpeg не найден (не критично для аудио)", tag="warn")
-    except Exception as e:
-        app.log(f"⚠️ Ошибка при проверке ffmpeg: {e}", tag="warn")
-
-    app.env_ffmpeg_label.config(text=f"ffmpeg: {ffmpeg_status}")
-
-    node_ver, node_cmd = _get_node_version(app)
-    if node_ver:
-        src = "PATH"
+    def _diag_log(msg: str, tag: str = "ok"):
         try:
-            if node_cmd:
-                n_abs = os.path.abspath(node_cmd)
-                for base in _frozen_binary_roots(app):
-                    if n_abs.startswith(os.path.abspath(base)):
-                        src = "local (app dir)"
-                        break
+            print(f"[ENV DIAGNOSTIC] {msg}")
         except Exception:
-            pass
-        app.log(f"✅ Node.js найден: {node_ver} [{src}]", tag="ok")
-        app.env_node_label.config(text=f"node: ✅ {node_ver}")
-    else:
-        app.log("ℹ️ Node.js не найден (важно для YouTube signature/EJS)", tag="warn")
-        app.env_node_label.config(text="node: ❌")
+            try:
+                safe = msg.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(sys.stdout.encoding or "utf-8")
+                print(f"[ENV DIAGNOSTIC] {safe}")
+            except Exception:
+                pass
+        if verbose:
+            app._enqueue_ui(lambda m=msg, t=tag: app.log(m, tag=t))
 
-    if _has_ytdlp_ejs():
-        app.log("✅ yt-dlp-ejs установлен (EJS solver scripts)", tag="ok")
-    else:
-        # Optional package; noisy as WARN — keep actionable but not alarming.
-        app.log("ℹ️ yt-dlp-ejs не найден (опционально): pip install -U yt-dlp-ejs", tag="ok")
-
-    cookies_path = app.get_cookies_path()
-    if cookies_path:
-        info = _analyze_cookies_txt(cookies_path)
-        if info["looks_like_auth"]:
-            app.log(
-                f"✅ cookies.txt найден (auth ok; yt={info['youtube_lines']}, google={info['google_lines']}): {cookies_path}",
-                tag="ok",
-            )
-            app.env_cookies_label.config(text="cookies.txt: ✅ (auth)")
-        else:
-            if not info["is_netscape"]:
-                app.log(f"⚠️ cookies.txt найден, но формат не Netscape (нужен cookies.txt): {cookies_path}", tag="warn")
-                app.env_cookies_label.config(text="cookies.txt: ⚠ (format)")
-            elif info["youtube_lines"] > 0 and info["google_lines"] == 0:
-                app.log(
-                    f"⚠️ cookies.txt найден, но в нем нет google.com cookies (yt={info['youtube_lines']}, google=0): {cookies_path}. "
-                    "Переэкспортируй cookies с включенными *.google.com + *.youtube.com.",
-                    tag="warn",
+    def _worker():
+        try:
+            # --- yt-dlp ---
+            ytdlp_status = "❌"
+            ytdlp_extra = ""
+            try:
+                ytdlp_cmd = app.get_ytdlp_cmd()
+                _diag_log(f"🔍 Проверка yt-dlp: {ytdlp_cmd}", tag="ok")
+                proc = subprocess.run(
+                    ytdlp_cmd + ["--version"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    check=False,
+                    timeout=10,
+                    **subprocess_window_kwargs(),
                 )
-                app.env_cookies_label.config(text="cookies.txt: ⚠ (no google auth)")
+                if proc.returncode != 0:
+                    rc, err = proc.returncode, proc.stderr
+                    _diag_log(f"❌ yt-dlp вернул код {rc}", tag="err")
+                    _diag_log(f"   stderr: {err}", tag="err")
+                else:
+                    ver = (proc.stdout or "").strip()
+                    ytdlp_status = "✅"
+                    if ver:
+                        ytdlp_extra = f" {ver}"
+                        _diag_log(f"✅ yt-dlp найден: {ver}", tag="ok")
+                    else:
+                        _diag_log("✅ yt-dlp найден (версия неизвестна)", tag="ok")
+            except subprocess.TimeoutExpired:
+                _diag_log("⚠️ Таймаут при проверке yt-dlp (процесс не ответил)", tag="warn")
+            except FileNotFoundError as e:
+                _diag_log(f"❌ yt-dlp не найден: {e}", tag="err")
+            except Exception as e:
+                _diag_log(f"❌ Ошибка при проверке yt-dlp: {e}", tag="err")
+
+            s, x = ytdlp_status, ytdlp_extra
+            app._enqueue_ui(lambda: app.env_ytdlp_label.config(text=f"yt-dlp: {s}{x}"))
+
+            # --- ffmpeg ---
+            ffmpeg_status = "❌"
+            try:
+                ffmpeg_path = app.get_ffmpeg_path()
+                if ffmpeg_path:
+                    _diag_log(f"✅ ffmpeg найден локально: {ffmpeg_path}", tag="ok")
+                    ffmpeg_status = "✅"
+                else:
+                    proc = subprocess.run(
+                        ["ffmpeg", "-version"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="ignore",
+                        check=False,
+                        timeout=10,
+                        **subprocess_window_kwargs(),
+                    )
+                    if proc.returncode == 0:
+                        ffmpeg_status = "✅"
+                        _diag_log("✅ ffmpeg найден в системном PATH", tag="ok")
+                    else:
+                        _diag_log("❌ ffmpeg не найден в PATH", tag="warn")
+            except subprocess.TimeoutExpired:
+                _diag_log("⚠️ Таймаут при проверке ffmpeg (процесс не ответил)", tag="warn")
+            except FileNotFoundError:
+                _diag_log("⚠️ ffmpeg не найден (не критично для аудио)", tag="warn")
+            except Exception as e:
+                _diag_log(f"⚠️ Ошибка при проверке ffmpeg: {e}", tag="warn")
+
+            fs = ffmpeg_status
+            app._enqueue_ui(lambda: app.env_ffmpeg_label.config(text=f"ffmpeg: {fs}"))
+
+            # --- Node.js ---
+            node_ver, node_cmd = _get_node_version(app)
+            if node_ver:
+                src = "PATH"
+                try:
+                    if node_cmd:
+                        n_abs = os.path.abspath(node_cmd)
+                        for base in _frozen_binary_roots(app):
+                            if n_abs.startswith(os.path.abspath(base)):
+                                src = "local (app dir)"
+                                break
+                except Exception:
+                    pass
+                _diag_log(f"✅ Node.js найден: {node_ver} [{src}]", tag="ok")
+                app._enqueue_ui(lambda v=node_ver: app.env_node_label.config(text=f"node: ✅ {v}"))
             else:
-                app.log(
-                    f"⚠️ cookies.txt найден, но auth cookies мало/нет (yt={info['youtube_lines']}, google={info['google_lines']}): {cookies_path}",
-                    tag="warn",
-                )
-                app.env_cookies_label.config(text="cookies.txt: ⚠ (weak auth)")
-    else:
-        app.log("ℹ️ cookies.txt не найден (не обязателен)", tag="warn")
-        app.env_cookies_label.config(text="cookies.txt: ❌")
+                _diag_log("ℹ️ Node.js не найден (важно для YouTube signature/EJS)", tag="warn")
+                app._enqueue_ui(lambda: app.env_node_label.config(text="node: ❌"))
+
+            # --- yt-dlp-ejs ---
+            if _has_ytdlp_ejs():
+                _diag_log("✅ yt-dlp-ejs установлен (EJS solver scripts)", tag="ok")
+            else:
+                _diag_log("ℹ️ yt-dlp-ejs не найден (опционально): pip install -U yt-dlp-ejs", tag="ok")
+
+            # --- cookies ---
+            cookies_path = app.get_cookies_path()
+            if cookies_path:
+                info = _analyze_cookies_txt(cookies_path)
+                if info["looks_like_auth"]:
+                    _diag_log(
+                        f"✅ cookies.txt найден (auth ok; yt={info['youtube_lines']}, google={info['google_lines']}): {cookies_path}",
+                        tag="ok",
+                    )
+                    app._enqueue_ui(lambda: app.env_cookies_label.config(text="cookies.txt: ✅ (auth)"))
+                else:
+                    if not info["is_netscape"]:
+                        _diag_log(f"⚠️ cookies.txt найден, но формат не Netscape: {cookies_path}", tag="warn")
+                        app._enqueue_ui(lambda: app.env_cookies_label.config(text="cookies.txt: ⚠ (format)"))
+                    elif info["youtube_lines"] > 0 and info["google_lines"] == 0:
+                        _diag_log(
+                            f"⚠️ cookies.txt найден, но нет google.com cookies (yt={info['youtube_lines']}, google=0): {cookies_path}. "
+                            "Переэкспортируй cookies с включенными *.google.com + *.youtube.com.",
+                            tag="warn",
+                        )
+                        app._enqueue_ui(lambda: app.env_cookies_label.config(text="cookies.txt: ⚠ (no google auth)"))
+                    else:
+                        _diag_log(
+                            f"⚠️ cookies.txt найден, но auth cookies мало/нет (yt={info['youtube_lines']}, google={info['google_lines']}): {cookies_path}",
+                            tag="warn",
+                        )
+                        app._enqueue_ui(lambda: app.env_cookies_label.config(text="cookies.txt: ⚠ (weak auth)"))
+            else:
+                _diag_log("ℹ️ cookies.txt не найден (не обязателен)", tag="warn")
+                app._enqueue_ui(lambda: app.env_cookies_label.config(text="cookies.txt: ❌"))
+        finally:
+            app._env_check_running = False
+
+    threading.Thread(target=_worker, daemon=True, name="EnvCheckWorker").start()
+

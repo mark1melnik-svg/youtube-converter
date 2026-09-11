@@ -1,4 +1,6 @@
 import os
+import re
+import time
 import subprocess
 import threading
 import shutil
@@ -114,7 +116,8 @@ def list_formats(app, url: str):
             ytdlp_cmd = app.get_ytdlp_cmd()
             cookies_path = app.get_cookies_path()
             cmd = ytdlp_cmd + [
-                "--extractor-args", "youtube:player_client=web,web_safari",
+                "--no-playlist",
+                "--extractor-args", "youtube:player_client=android,web",
                 "--list-formats",
                 url,
             ]
@@ -256,6 +259,57 @@ def _estimate_produced_files(output_lines) -> int:
     except Exception:
         return 1
 
+def _sanitize_for_fs(name: str) -> str:
+    # Remove characters invalid on Windows filesystems and strip spaces/dots
+    sanitized = re.sub(r'[\\/*?:"<>|]', '_', name).strip(' .')
+    return sanitized
+
+
+def _format_candidate_filename(tmpl: str, title: str, uploader: str = "", video_id: str = "") -> str:
+    res = tmpl or "%(title)s"
+    if "%(title)s" in res:
+        res = res.replace("%(title)s", title or "")
+    if "%(title,id)s" in res:
+        res = res.replace("%(title,id)s", title or video_id or "")
+    if "%(uploader)s" in res:
+        res = res.replace("%(uploader)s", uploader or "")
+    if "%(id)s" in res:
+        res = res.replace("%(id)s", video_id or "")
+    return _sanitize_for_fs(res)
+
+
+def _compute_outtmpl_with_duplicate_protection(download_path: str, title: str, ext: str, base_template: str = None, uploader: str = "", video_id: str = "") -> str:
+    tmpl = base_template or "%(title)s"
+    if not title:
+        return os.path.join(download_path, f"{tmpl}.%(ext)s")
+
+    candidate = _format_candidate_filename(tmpl, title, uploader, video_id)
+    if not candidate:
+        candidate = _sanitize_for_fs(title)
+    if not candidate:
+        return os.path.join(download_path, f"{tmpl}.%(ext)s")
+
+    # Check if download_path exists
+    if not os.path.isdir(download_path):
+        return os.path.join(download_path, f"{tmpl}.%(ext)s")
+
+    # Look for collisions among files in the directory
+    # Handle case-insensitive match on Windows
+    try:
+        existing_files = {f.lower() for f in os.listdir(download_path) if os.path.isfile(os.path.join(download_path, f))}
+    except Exception:
+        existing_files = set()
+
+    base_candidate = f"{candidate}.{ext}".lower()
+    if base_candidate not in existing_files:
+        return os.path.join(download_path, f"{tmpl}.%(ext)s")
+
+    i = 1
+    while f"{candidate} ({i}).{ext}".lower() in existing_files:
+        i += 1
+    return os.path.join(download_path, f"{tmpl} ({i}).%(ext)s")
+
+
 def _with_soft_video_format(cmd, audio_only):
     if audio_only:
         return _replace_flag_with_value(cmd, "-f", "bestaudio/best")
@@ -274,7 +328,12 @@ def _cookies_has_google_domain(cookies_path: str | None) -> bool:
 
 
 def _build_video_format_expr(container: str, max_height: str) -> str:
-    # Prefer exact/near target height, then allow lower as fallback.
+    # Resilient format expressions with multi-level fallbacks:
+    # 1. target container & codec <= max_height + audio
+    # 2. any video <= max_height + audio
+    # 3. best combined stream <= max_height
+    # 4. any bestvideo + bestaudio
+    # 5. ultimate fallback: best / b
     if container == "webm":
         primary = "bestvideo[vcodec^=vp9][ext=webm]/bestvideo[ext=webm]/bestvideo"
         mux_audio = "bestaudio[ext=webm]/bestaudio"
@@ -283,12 +342,15 @@ def _build_video_format_expr(container: str, max_height: str) -> str:
         mux_audio = "bestaudio[ext=m4a]/bestaudio"
 
     if max_height == "best":
-        return f"({primary})+({mux_audio})/best"
+        return f"({primary})+({mux_audio})/bestvideo+bestaudio/best"
 
-    # Restrict to requested max resolution, keeping stream preference order.
+    # Multi-tier fallback chain preventing "Requested format is not available"
     return (
         f"({primary})[height<={max_height}]+({mux_audio})/"
-        f"best[height<={max_height}]/best"
+        f"bestvideo[height<={max_height}]+bestaudio/"
+        f"best[height<={max_height}]/"
+        f"bestvideo+bestaudio/"
+        f"best"
     )
 
 
@@ -346,16 +408,9 @@ def download_video(app, from_queue=False, url_override=None, mode_override=None)
     app.status_label.config(text=app._t("status_downloading"))
     app.progress.configure(mode="determinate", maximum=100, value=0)
 
-    app.log("=" * 50)
-    app.log(app._t("start_cli"))
-    app.log(app._t("log_type").format(type=mode))
-    app.log(app._t("log_fmt").format(fmt=fmt))
-    app.log(app._t("log_audio_only").format(audio_only=audio_only))
-    app.log(f"   Video quality: {video_quality}")
-    app.log(f"   Audio quality: {audio_quality}")
-    app.log(f"   Auto numbering: {app.auto_number_files}")
-    app.log(app._t("log_folder").format(path=download_path))
-    app.log("=" * 50)
+    qual_str = f"{video_quality}p" if not audio_only else f"{audio_quality}kbps"
+    app.log(app._t("log_start_download").format(mode=mode, quality=qual_str))
+    app.log(app._t("log_target_folder").format(path=download_path))
 
     app.cancel_requested = False
     v_cont = app.video_container_var.get().lower()
@@ -369,10 +424,14 @@ def download_video(app, from_queue=False, url_override=None, mode_override=None)
     cookies_has_google = _cookies_has_google_domain(cookies_path)
     if cookies_path and not cookies_has_google:
         app.log(
-            "⚠️ cookies.txt не содержит google.com cookies. "
-            "Это часто вызывает YouTube bot-check даже при валидном youtube.com.",
+            app._t("log_cookies_missing_google"),
             tag="warn",
         )
+
+    time_from = getattr(app, "time_from_var", None)
+    time_to = getattr(app, "time_to_var", None)
+    t_from = time_from.get().strip() if time_from else ""
+    t_to = time_to.get().strip() if time_to else ""
 
     app.download_thread = threading.Thread(
         target=download_worker,
@@ -380,6 +439,7 @@ def download_video(app, from_queue=False, url_override=None, mode_override=None)
             app, url, fmt, download_path, audio_only, v_cont, a_cont,
             ffmpeg_path, cookies_path, mode, from_queue,
             subs_enabled, subs_lang, subs_auto, subs_srt, audio_quality, video_quality, cookies_has_google,
+            t_from, t_to,
         ),
         daemon=True,
     )
@@ -396,46 +456,91 @@ def cancel_download(app):
             app.log(f"⚠️ {e}", tag="err")
 
 
+def _extract_downloaded_filepath(output_lines: list[str], default_path: str) -> str:
+    for line in reversed(output_lines):
+        line = line.strip()
+        if "[ExtractAudio] Destination:" in line:
+            fp = line.split("[ExtractAudio] Destination:", 1)[1].strip()
+            if os.path.isfile(fp):
+                return os.path.normpath(fp)
+        if "Merging formats into" in line:
+            m = re.search(r'Merging formats into ["\']?(.*?)["\']?$', line)
+            if m and os.path.isfile(m.group(1)):
+                return os.path.normpath(m.group(1))
+        if "[download] Destination:" in line:
+            fp = line.split("[download] Destination:", 1)[1].strip()
+            if os.path.isfile(fp):
+                return os.path.normpath(fp)
+        if "has already been downloaded" in line:
+            m = re.search(r'\[download\]\s+(.*?)\s+has already been downloaded', line)
+            if m and os.path.isfile(m.group(1)):
+                return os.path.normpath(m.group(1))
+    return default_path
+
+
 def download_worker(
     app, url, fmt, download_path, audio_only, v_cont,
     a_cont, ffmpeg_path, cookies_path, mode, from_queue,
     subs_enabled, subs_lang, subs_auto, subs_srt, audio_quality, video_quality, cookies_has_google,
+    time_from="", time_to="",
 ):
     try:
-        outtmpl = app._get_output_template_with_choice(download_path, "%(ext)s")
+        # Determine file extension for duplicate conflict check
+        if mode == "only_subtitles":
+            target_ext = "srt"
+        elif audio_only:
+            target_ext = a_cont
+        else:
+            target_ext = v_cont
 
         ytdlp_cmd = app.get_ytdlp_cmd()
-        app._enqueue_ui(
-            lambda c=ytdlp_cmd: app.log(
-                f"ℹ️ yt-dlp selected: {c[0]} [{app._describe_ytdlp_source(c)}]",
-                tag="ok",
-            )
-        )
         run_env = _ytdlp_env(app)
-        try:
-            ver_proc = subprocess.run(
-                ytdlp_cmd + ["--version"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                check=False,
-                env=run_env,
-                **subprocess_window_kwargs(),
-            )
-            version = (ver_proc.stdout or "").strip()
-            if ver_proc.returncode == 0 and version:
-                app._enqueue_ui(lambda v=version: app.log(f"ℹ️ yt-dlp version: {v}", tag="ok"))
-            elif ver_proc.returncode != 0 and ver_proc.stderr:
-                app._enqueue_ui(lambda e=ver_proc.stderr.strip(): app.log(f"⚠️ yt-dlp version check failed: {e}", tag="warn"))
-        except Exception as e:
-            app._enqueue_ui(lambda err=str(e): app.log(f"⚠️ yt-dlp version check error: {err}", tag="warn"))
+
+        title_hint = getattr(app, "preview_video_title", "")
+        uploader_hint = getattr(app, "preview_uploader", "")
+        id_hint = getattr(app, "preview_video_id", "")
+        if app.auto_number_files and not title_hint:
+            try:
+                title_proc = subprocess.run(
+                    ytdlp_cmd + ["--no-playlist", "--print", "%(title)s\t%(uploader)s\t%(id)s", url],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    env=run_env,
+                    timeout=5,
+                    **subprocess_window_kwargs(),
+                )
+                if title_proc.returncode == 0 and title_proc.stdout.strip():
+                    parts = title_proc.stdout.strip().splitlines()[0].split("\t")
+                    if len(parts) >= 1 and parts[0]:
+                        title_hint = parts[0]
+                    if len(parts) >= 2 and parts[1]:
+                        uploader_hint = parts[1]
+                    if len(parts) >= 3 and parts[2]:
+                        id_hint = parts[2]
+            except Exception:
+                pass
+
+        base_tmpl = (app.filename_template or "%(title)s").strip()
+        if app.auto_number_files and title_hint:
+            outtmpl = _compute_outtmpl_with_duplicate_protection(download_path, title_hint, target_ext, base_tmpl, uploader_hint, id_hint)
+        else:
+            outtmpl = app._get_output_template_with_choice(download_path, "%(ext)s")
+
+        # Enforce single video download unless user explicitly toggled playlist download
+        download_playlist = getattr(app, "download_playlist_var", None)
+        playlist_enabled = download_playlist.get() if download_playlist else getattr(app, "download_playlist_enabled", False)
 
         cmd = ytdlp_cmd + [
-            "--extractor-args", "youtube:player_client=web,web_safari",
+            "--extractor-args", "youtube:player_client=android,web",
             "--extractor-retries", "3",
             "--retries", "3",
+        ]
+        if not playlist_enabled:
+            cmd.append("--no-playlist")
+
+        cmd += [
             url,
             "-o", outtmpl,
         ]
@@ -445,30 +550,43 @@ def download_worker(
         if cookies_path:
             cmd += ["--cookies", cookies_path]
 
-        if ffmpeg_path:
-            cmd += ["--ffmpeg-location", ffmpeg_path]
-        if cookies_path:
-            cmd += ["--cookies", cookies_path]
-
         if mode == "only_subtitles":
             cmd += ["--skip-download"]
         elif audio_only:
-            cmd += ["--extract-audio", "--audio-format", a_cont, "-f", fmt]
+            cmd += ["--extract-audio", "--audio-format", a_cont, "-f", fmt, "--no-cache-dir"]
             if audio_quality != "best":
-                cmd += ["--audio-quality", f"{audio_quality}K"]
-                if a_cont in ("mp3", "m4a"):
-                    cmd += ["--postprocessor-args", f"-b:a {audio_quality}k"]
+                cmd += ["--postprocessor-args", f"ExtractAudio:-b:a {audio_quality}k"]
 
         else:
             cmd += ["-f", fmt]
-            if v_cont in ("mp4", "webm"):
+            if v_cont in ("mp4", "webm", "mkv"):
                 cmd += ["--merge-output-format", v_cont, "--remux-video", v_cont]
             if video_quality != "best":
                 cmd += ["-S", f"res:{video_quality},vcodec,acodec"]
-        if app.auto_number_files:
-            start_no = int(getattr(app, "autonumber_next", 1) or 1)
-            cmd += ["--autonumber-start", str(start_no)]
-        else:
+
+            # Hardware Acceleration (strictly for video formats)
+            hw_accel = getattr(app, "hw_accel", "auto")
+            if hw_accel == "nvenc":
+                cmd += [
+                    "--postprocessor-args", "VideoConvertor:-c:v h264_nvenc -preset p4",
+                    "--downloader-args", "ffmpeg_i:-hwaccel cuda",
+                ]
+            elif hw_accel == "qsv":
+                cmd += [
+                    "--postprocessor-args", "VideoConvertor:-c:v h264_qsv",
+                    "--downloader-args", "ffmpeg_i:-hwaccel qsv",
+                ]
+            elif hw_accel == "amf":
+                cmd += [
+                    "--postprocessor-args", "VideoConvertor:-c:v h264_amf",
+                    "--downloader-args", "ffmpeg_i:-hwaccel d3d11va",
+                ]
+            elif hw_accel == "auto":
+                cmd += [
+                    "--downloader-args", "ffmpeg_i:-hwaccel auto",
+                ]
+
+        if not app.auto_number_files:
             # Safety: never silently overwrite existing files when numbering is off.
             cmd += ["--no-overwrites"]
 
@@ -484,21 +602,24 @@ def download_worker(
             if subs_srt:
                 cmd += ["--convert-subs", "srt"]
 
+        # Trim / sections
+        if time_from or time_to:
+            tf = (time_from or "0").strip()
+            tt = (time_to or "inf").strip()
+            cmd += ["--download-sections", f"*{tf}-{tt}", "--force-keyframes-at-cuts"]
+            app._enqueue_ui(lambda f=tf, t=tt: app.log(app._t("log_trim_section").format(f=f, t=t), tag="ok"))
+
+        # Embed thumbnail & metadata into audio files
+        embed_metadata = getattr(app, "embed_metadata_var", None)
+        embed_enabled = embed_metadata.get() if embed_metadata else True
+        if embed_enabled and audio_only:
+            cmd += ["--embed-thumbnail", "--add-metadata"]
+
         # Enable JS challenge solving proactively (YouTube EJS)
         cmd = _add_js_runtime_hints(cmd, app)
 
-        if app.auto_number_files:
-            sn = int(getattr(app, "autonumber_next", 1) or 1)
-            app._enqueue_ui(
-                lambda s=sn: app.log(
-                    f"ℹ️ Автонумерация: старт yt-dlp = {s} (сохранённый счётчик autonumber_next)",
-                    tag="ok",
-                )
-            )
-
-        app._enqueue_ui(lambda: app.log(app._t("log_cmd").format(cmd=" ".join(cmd))))
-
         def run_attempt(attempt_cmd):
+            app._enqueue_ui(lambda c=attempt_cmd: app.log(app._t("log_cmd").format(cmd=" ".join(c))))
             captured = []
             app.current_process = subprocess.Popen(
                 attempt_cmd,
@@ -512,25 +633,52 @@ def download_worker(
             )
 
             assert app.current_process.stdout is not None
+            last_progress_update_time = 0.0
+            last_pct_value = -1.0
+            ffmpeg_processing_notified = False
+
             for line in app.current_process.stdout:
                 if app.cancel_requested:
                     break
                 line = line.rstrip("\n")
                 captured.append(line)
 
+                # Progress handling with throttling
                 m = app.progress_re.search(line)
                 if m:
                     try:
                         pct = float(m.group(1))
                     except ValueError:
                         pct = 0.0
-                    app._enqueue_ui(lambda p=pct: app.progress.configure(value=p))
 
-                app._enqueue_ui(lambda l=line: app.log(l))
+                    now = time.time()
+                    if (now - last_progress_update_time >= 0.1) or pct >= 100.0 or abs(pct - last_pct_value) >= 5.0:
+                        last_progress_update_time = now
+                        last_pct_value = pct
+
+                        def update_ui_progress(p=pct):
+                            app.progress.configure(value=p)
+                            app.status_label.config(text=f"⬇️ {p:.1f}%")
+
+                        app._enqueue_ui(update_ui_progress)
+                    # Don't log individual progress lines to log box
+                    continue
+
+                # Notify ffmpeg / merger stage
+                if ("[Merger]" in line or "[ExtractAudio]" in line or "Merging formats" in line) and not ffmpeg_processing_notified:
+                    ffmpeg_processing_notified = True
+                    app._enqueue_ui(lambda: app.log(app._t("log_ffmpeg_processing"), tag="ok"))
+                    app._enqueue_ui(lambda: app.status_label.config(text=app._t("status_ffmpeg_processing")))
+
+                # Log errors and warnings
+                lu = line.upper()
+                if "ERROR:" in lu or "TRACEBACK" in lu or "SIGN IN TO CONFIRM" in lu:
+                    app._enqueue_ui(lambda l=line: app.log(l, tag="err"))
+                elif "WARNING:" in lu:
+                    app._enqueue_ui(lambda l=line: app.log(l, tag="warn"))
 
             ret_code = app.current_process.wait()
             app.current_process = None
-            app._enqueue_ui(lambda r=ret_code: app.log(f"ℹ️ yt-dlp exit code: {r}"))
             return ret_code, captured
 
         ret, output_lines = run_attempt(cmd)
@@ -542,7 +690,7 @@ def download_worker(
             retry_base = _replace_flag_with_value(
                 retry_base,
                 "--extractor-args",
-                "youtube:player_client=web,web_safari"
+                "youtube:player_client=android,web"
             )
             for browser in ("chrome", "edge", "firefox", "brave"):
                 if app.cancel_requested:
@@ -667,7 +815,10 @@ def download_worker(
                 messagebox.showerror(app._t("download_error_title"), app._t("download_error_box"))
                 app.status_label.config(text=app._t("status_error"))
                 app.progress.configure(value=0)
-                app.notebook.select(app.tab_log)
+                if hasattr(app, "tabview"):
+                    app.tabview.set(app._t("tab_log"))
+                elif hasattr(app, "notebook"):
+                    app.notebook.select(app.tab_log)
             app._enqueue_ui(on_error)
         else:
             # Estimate number of produced files to advance autonumber across runs.
@@ -679,30 +830,21 @@ def download_worker(
                 app.progress.configure(value=100)
                 if (not app.auto_number_files) and _looks_like_no_overwrite_skip(output_lines):
                     app.log(
-                        "ℹ️ Файл уже существует — перезапись запрещена. "
-                        "Включи нумерацию файлов, если хочешь сохранять копии.",
+                        app._t("log_file_exists_no_overwrite"),
                         tag="warn",
                     )
-                if app.auto_number_files:
-                    try:
-                        prev = int(getattr(app, "autonumber_next", 1) or 1)
-                        inc = int(produced) if int(produced) > 0 else 1
-                        app.autonumber_next = prev + inc
-                        app.log(
-                            f"ℹ️ Автонумерация: +{inc} → следующий номер будет {app.autonumber_next}",
-                            tag="ok",
-                        )
-                    except Exception:
-                        app.autonumber_next = int(getattr(app, "autonumber_next", 1) or 1) + 1
-                        app.log(
-                            f"ℹ️ Автонумерация: счётчик → {app.autonumber_next}",
-                            tag="ok",
-                        )
                 app.save_settings()
-                app.add_history_entry(url, mode, download_path)
+                downloaded_file = _extract_downloaded_filepath(output_lines, download_path)
+                app.add_history_entry(url, mode, download_path, downloaded_file)
+                if downloaded_file and os.path.isfile(downloaded_file):
+                    app.last_downloaded_file = downloaded_file
+                    app.log(app._t("log_saved_file").format(path=downloaded_file), tag="ok")
                 if app.open_folder_after_download and os.name == "nt":
                     try:
-                        os.startfile(download_path)
+                        if downloaded_file and os.path.isfile(downloaded_file):
+                            subprocess.Popen(["explorer", f"/select,{os.path.normpath(downloaded_file)}"])
+                        else:
+                            os.startfile(download_path)
                     except Exception as e:
                         app.log(app._t("open_folder_fail").format(err=e), tag="err")
             app._enqueue_ui(on_ok)
@@ -715,7 +857,10 @@ def download_worker(
             messagebox.showerror(app._t("error_title"), msg)
             app.status_label.config(text=app._t("status_error"))
             app.progress.configure(value=0)
-            app.notebook.select(app.tab_log)
+            if hasattr(app, "tabview"):
+                app.tabview.set(app._t("tab_log"))
+            elif hasattr(app, "notebook"):
+                app.notebook.select(app.tab_log)
         app._enqueue_ui(on_exc)
 
     finally:
